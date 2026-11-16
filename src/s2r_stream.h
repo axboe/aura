@@ -13,12 +13,18 @@
 
 #define S2R_STREAM_MAGIC 0x46523253u /* "S2RF" */
 #define S2R_STREAM_VER   1
-#define S2R_STREAM_CHUNK 128 /* records in an 'R' frame */
+#define S2R_STREAM_CHUNK 128 /* records in an 'R' or 'S' frame */
+
+/* A state record is a ring record whose pc says how the read went. */
+#define S2R_STATE_OK    0 /* val: the register's value */
+#define S2R_STATE_FAULT 1 /* the read faulted (aura's abort guard caught it); val: 0 */
+#define S2R_STATE_OFF   2 /* not read: its gate, a power word, does not read on; val: that word */
 
 #define S2R_FRAME_HEARTBEAT                                                                        \
     'H'                       /* a: count, b: 1 once the sleep rules are armed; payload: head, t */
 #define S2R_FRAME_INFO    'I' /* a: pass; payload: struct s2r_stream_info */
 #define S2R_FRAME_RECORDS 'R' /* a: pass, b/c: sequence number of the first record (low, high) */
+#define S2R_FRAME_STATE   'S' /* a: pass, b: index of the first record, c: records in all */
 #define S2R_FRAME_END     'E' /* a: pass, b: record frames sent in it, c: 1 for a whole-ring pass */
 
 struct s2r_stream_hdr {

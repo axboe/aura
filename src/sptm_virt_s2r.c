@@ -136,6 +136,21 @@ u32 sptm_virt_s2r_stream;
 /* EXPERIMENT (host, before entry): seconds after the entry at which a live snapshot of the ring is
  * streamed with the guest running on (0: never). The host can also ask for one by sending "DUMP". */
 u32 sptm_virt_s2r_stream_at;
+/*
+ * EXPERIMENT (host, before entry): registers whose VALUE is read at a withheld commit and sent
+ * with the ring, for a state the host can compare with another OS's. Runs of words: base, then
+ * count [15:0] | stride [31:16] | log2 of the width in bytes [35:32], then a gate: the address of
+ * a power word that must read fully on (actual state 0xf) for the run to be read at all, or 0.
+ * A count of 0 ends the list. Every read runs under aura's abort guard with SError unmasked, and
+ * a fault is recorded, not taken. sptm_virt_s2r_state_late: read the state only after the ring
+ * has gone out whole once, so a read that hangs the bus cannot cost the ring.
+ */
+#define S2R_STATE_RUNS 128
+#define S2R_STATE_MAX  2048
+u64 sptm_virt_s2r_state[S2R_STATE_RUNS][3];
+u32 sptm_virt_s2r_state_late;
+static struct s2r_rec *s2r_state_buf;
+static u32 s2r_state_n;
 /* S2R_CP_ANSX_QUIET: XNU's NVMe registers (sart-ans reg[2]); per-I/O writes are only counted */
 static u64 s2r_nvme_quiet_page, s2r_nvme_quiet_n;
 
@@ -750,6 +765,10 @@ static void s2r_stream_step(void)
 
     if (!s2r_stream_in_pass) {
         s2r_stream_send(S2R_FRAME_INFO, s2r_stream_pass, s2r_stream_mode, 0, info, sizeof(*info));
+        /* The state, if it was read: small, so whole in every pass, ahead of the records. */
+        for (u32 k = 0; s2r_stream_mode == 2 && k < s2r_state_n; k += S2R_STREAM_CHUNK)
+            s2r_stream_send(S2R_FRAME_STATE, s2r_stream_pass, k, s2r_state_n, &s2r_state_buf[k],
+                            min(s2r_state_n - k, (u32)S2R_STREAM_CHUNK) * sizeof(struct s2r_rec));
         s2r_stream_in_pass = true;
         s2r_stream_end = info->head;
         s2r_stream_frames = 0;
@@ -774,6 +793,74 @@ static void s2r_stream_step(void)
     s2r_stream_done++;
 }
 
+static bool s2r_state_read(u64 pa, int width, u64 *val)
+{
+    u64 daif = mrs(DAIF);
+
+    *val = 0;
+    exc_count = 0;
+    exc_guard = GUARD_SKIP | GUARD_SILENT;
+    msr(DAIF, daif & ~BIT(8)); /* SError is how a block that is off answers */
+    sysop("isb");
+    switch (width) {
+        case 0:
+            *val = read8(pa);
+            break;
+        case 1:
+            *val = read16(pa);
+            break;
+        case 2:
+            *val = read32(pa);
+            break;
+        default:
+            *val = read64(pa);
+            break;
+    }
+    sysop("dsb sy");
+    sysop("isb");
+    msr(DAIF, daif);
+    sysop("isb");
+    exc_guard = GUARD_OFF;
+    return !exc_count;
+}
+
+/* The registers of sptm_virt_s2r_state, read once, into s2r_state_buf. */
+static void s2r_state_snapshot(void)
+{
+    u64 daif = mrs(DAIF);
+
+    if (!s2r_state_buf || s2r_state_n)
+        return;
+    /* An SError that was pending before the first read must not be counted against it. */
+    exc_guard = GUARD_SKIP | GUARD_SILENT;
+    msr(DAIF, daif & ~BIT(8));
+    sysop("isb");
+    msr(DAIF, daif);
+    sysop("isb");
+    exc_guard = GUARD_OFF;
+    for (int i = 0; i < S2R_STATE_RUNS && (sptm_virt_s2r_state[i][1] & 0xffff); i++) {
+        u64 base = sptm_virt_s2r_state[i][0], desc = sptm_virt_s2r_state[i][1];
+        u64 gate = sptm_virt_s2r_state[i][2], gval = 0;
+        u32 count = desc & 0xffff, stride = (desc >> 16) & 0xffff;
+        int width = (desc >> 32) & 3;
+        u64 status = S2R_STATE_OK;
+
+        if (gate && (!s2r_state_read(gate, 2, &gval) || ((gval >> 4) & 0xf) != 0xf))
+            status = S2R_STATE_OFF;
+        for (u32 k = 0; k < count && s2r_state_n < S2R_STATE_MAX; k++) {
+            struct s2r_rec *r = &s2r_state_buf[s2r_state_n++];
+            u64 pa = base + (u64)k * stride, val = gval;
+
+            r->pc = status;
+            if (status == S2R_STATE_OK && !s2r_state_read(pa, width, &val))
+                r->pc = S2R_STATE_FAULT;
+            r->t = mrs(CNTPCT_EL0);
+            r->meta = S2R_META(pa, width, 0, smp_id(), 0);
+            r->val = val;
+        }
+    }
+}
+
 /* The guest is over: this core sends the ring for ever. */
 static void __attribute__((noreturn)) s2r_stream_hold(const char *reason, struct exc_info *ctx,
                                                       u64 addr, u64 val)
@@ -787,8 +874,13 @@ static void __attribute__((noreturn)) s2r_stream_hold(const char *reason, struct
     sptm_virt_s2r_quiet = true;
     s2r_stream_snapshot(reason, ctx, addr, val);
     s2r_stream_mode = 2;
-    while (1)
+    if (!sptm_virt_s2r_state_late)
+        s2r_state_snapshot();
+    while (1) {
         s2r_stream_step();
+        if (sptm_virt_s2r_state_late && s2r_stream_done >= 2)
+            s2r_state_snapshot();
+    }
 }
 
 /* The guest runs on: its cores send the snapshot between them (s2r_stream_poll). */
@@ -1480,6 +1572,8 @@ void sptm_virt_s2r_setup(bool cdc)
             }
         }
         s2r_hook_range("s2r-timer", s2r_soc->stop_timer & ~0x3fffUL, 0x4000);
+        if (sptm_virt_s2r_state[0][1] & 0xffff) /* EXPERIMENT: room for the state snapshot */
+            s2r_state_buf = memalign(0x4000, S2R_STATE_MAX * sizeof(struct s2r_rec));
         for (unsigned i = 0; i < S2R_EXTRA_RANGES && sptm_virt_s2r_extra[i][1]; i++) {
             const struct s2r_trace_blk x = {sptm_virt_s2r_extra[i][0], sptm_virt_s2r_extra[i][1],
                                             sptm_virt_s2r_extra[i][1],
