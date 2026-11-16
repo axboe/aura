@@ -3246,8 +3246,8 @@ static const struct {
     bool ext; /* also hand off the external display engines running this image */
 } t6050_images[] = {
     {V27_0, "64863924-B56B-3E32-87FE-038677F52709", true},
-    /* K116s (16" M5 Pro, OLED), 26B8125: the internal panel only */
-    {V27_2, "3D6C8857-E6F1-3D2E-9DFF-587028AE0C6E", false},
+    /* K116s (16" M5 Pro, OLED), 26B8125: EXPERIMENT: the external engines too, as on 27.0 */
+    {V27_2, "3D6C8857-E6F1-3D2E-9DFF-587028AE0C6E", true},
 };
 #define T6050_NDISP     5       /* disp0 reg[0..4] are the dcp's disp-0..disp-4 */
 #define T6050_BW_BASE   0x20000 /* bandwidth agent 0's scratch in the PMC metadata */
