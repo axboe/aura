@@ -115,8 +115,11 @@ u32 sptm_virt_s2r_cp_ansx;      /* T6050 COPROC: S2R_CP_ANSX_* pages around ANS 
 /* Timer-only sleep: further [base, size] ranges to capture, set by the host before entry. Each
  * must be a 16 KiB aligned range the ADT gives (a reg entry or part of one); 0 size ends the
  * list. The accesses are performed as issued and recorded, like the ADT's own trace blocks. */
-#define S2R_EXTRA_RANGES 32
+#define S2R_EXTRA_RANGES 64
 u64 sptm_virt_s2r_extra[S2R_EXTRA_RANGES][2];
+/* EXPERIMENT (host): bit i set: range i records its writes only (a page the guest reads all the
+ * time, as the PTD's first page: 87% of a K116s capture were its reads). */
+u64 sptm_virt_s2r_extra_wo;
 /*
  * EXPERIMENT. sptm_virt_s2r_stream (host, before entry; the number of record frames in a quick
  * pass, 0 = off). For a machine whose debug link carries nothing aura prints under the guest and
@@ -802,10 +805,11 @@ static void s2r_stream_live(const char *reason)
 
 /*
  * sptm_virt_s2.c, the reset guard, for a watchdog write it held back once the sleep rules are
- * armed. XNU's panic flow first stops the watchdog (0 to the sleep watchdog's control): the ring
- * is frozen there, so it keeps what led to the panic while the panic prints. The flow ends in the
- * reset write (the wdt node's reg 1): that core then sends the ring instead of going on to the
- * reset XNU gets by other means (on 2026-11-16 the Mac reset 2 s after the held write).
+ * armed. XNU's panic flow ends in the reset write (the wdt node's reg 1): that core then sends the
+ * ring instead of going on to the reset XNU gets by other means (on 2026-11-16 the Mac reset 2 s
+ * after the held write). Nothing is frozen earlier: a write of 0 to the sleep watchdog's control
+ * is also the last thing a guest with wdt=-1 does before its sleep commit, and freezing there cut
+ * the commit record out of the first captures.
  */
 void sptm_virt_s2r_reset_event(struct exc_info *ctx, int slot, u64 addr, u64 val)
 {
@@ -813,18 +817,6 @@ void sptm_virt_s2r_reset_event(struct exc_info *ctx, int slot, u64 addr, u64 val
         return;
     if (slot == 2)
         s2r_stream_hold("S2RRESET", ctx, addr, val);
-    if (slot == 0 && !val && !s2r_stream_frozen) {
-        while (!s2r_stream_trylock())
-            ;
-        if (!s2r_stream_mode && !s2r_stream_frozen) {
-            bool quiet = sptm_virt_s2r_quiet;
-            sptm_virt_s2r_quiet = true;
-            s2r_marker("S2RPANIC", addr);
-            sptm_virt_s2r_quiet = quiet;
-            s2r_stream_frozen = true;
-        }
-        spin_unlock(&s2r_stream_lock);
-    }
 }
 
 /*
@@ -916,14 +908,18 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
         }
         s2r_stream_poll();
         if (width == 4) {
+            bool first;
             s2r_rw128(addr, val, write);
-            sptm_virt_s2r_note(ctx, addr, val[0], write, 3);
-            sptm_virt_s2r_note(ctx, addr + 8, val[1], write, 3);
+            if (write || strcmp(s2r_page_name(addr & ~0x3fffUL, &first), "extra-wo")) {
+                sptm_virt_s2r_note(ctx, addr, val[0], write, 3);
+                sptm_virt_s2r_note(ctx, addr + 8, val[1], write, 3);
+            }
         } else if (width >= 0 && width <= 3) {
             sptm_virt_mmio_rw(addr, val, write, width);
             /* XNU polls the cores' counters there all the time; their writes still go in. */
             bool first;
-            if (write || strcmp(s2r_page_name(addr & ~0x3fffUL, &first), "cpu-impl"))
+            const char *what = s2r_page_name(addr & ~0x3fffUL, &first);
+            if (write || (strcmp(what, "cpu-impl") && strcmp(what, "extra-wo")))
                 sptm_virt_s2r_note(ctx, addr, *val, write, width);
         } else {
             return false;
@@ -1486,7 +1482,8 @@ void sptm_virt_s2r_setup(bool cdc)
         s2r_hook_range("s2r-timer", s2r_soc->stop_timer & ~0x3fffUL, 0x4000);
         for (unsigned i = 0; i < S2R_EXTRA_RANGES && sptm_virt_s2r_extra[i][1]; i++) {
             const struct s2r_trace_blk x = {sptm_virt_s2r_extra[i][0], sptm_virt_s2r_extra[i][1],
-                                            sptm_virt_s2r_extra[i][1], "extra"};
+                                            sptm_virt_s2r_extra[i][1],
+                                            sptm_virt_s2r_extra_wo & BIT(i) ? "extra-wo" : "extra"};
             if (!x.base || (x.base & 0x3fff) || (x.size & 3) || x.size > ~0UL - x.base) {
                 printf("SPTM-virt[s2r]: extra range 0x%lx + 0x%lx refused\n", x.base, x.size);
                 continue;
