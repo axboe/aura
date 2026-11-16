@@ -11,6 +11,7 @@ int dockchannel_uart_init(void);
 u32 dockchannel_uart_tx_free(void);
 void dockchannel_uart_set_tx_timeout(u32 ms);
 void dockchannel_uart_write_wait(const void *buf, size_t count);
+int dockchannel_uart_try_getbyte(void);
 void dockchannel_uart_putbyte(u8 c);
 u8 dockchannel_uart_getbyte(void);
 

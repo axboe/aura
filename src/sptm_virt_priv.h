@@ -110,6 +110,9 @@ void sptm_virt_s2r_dump_tail(u64 n);
 void sptm_virt_s2r_wd_stopped(void);
 bool sptm_virt_s2r_commit_withheld(void);
 bool sptm_virt_s2r_wfi(u64 *regs, u64 esr);
+/* EXPERIMENT: the reset guard held a watchdog write back (slot 0: the sleep watchdog's control,
+ * 2: the node's reg 1, XNU's reset). With sptm_virt_s2r_stream the ring may be sent from here. */
+void sptm_virt_s2r_reset_event(struct exc_info *ctx, int slot, u64 addr, u64 val);
 
 /* sptm_virt_gpu.c */
 void sptm_virt_gpu_setup(void);

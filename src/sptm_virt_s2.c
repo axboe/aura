@@ -215,6 +215,7 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
                 if (held_logs++ < 48)
                     printf("SPTM-virt[rst c%d]: held back 0x%lx -> [0x%lx] (pc 0x%lx)\n",
                            smp_id(), *val, addr, ctx->elr);
+                sptm_virt_s2r_reset_event(ctx, slot, addr, *val); /* EXPERIMENT: may not return */
                 return true;
             }
             if (held_set & BIT(slot)) {

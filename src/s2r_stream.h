@@ -13,7 +13,7 @@
 
 #define S2R_STREAM_MAGIC 0x46523253u /* "S2RF" */
 #define S2R_STREAM_VER   1
-#define S2R_STREAM_CHUNK 256 /* records in an 'R' frame */
+#define S2R_STREAM_CHUNK 128 /* records in an 'R' frame */
 
 #define S2R_FRAME_HEARTBEAT                                                                        \
     'H'                       /* a: count, b: 1 once the sleep rules are armed; payload: head, t */

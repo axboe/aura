@@ -155,6 +155,14 @@ void dockchannel_uart_write_wait(const void *buf, size_t count)
     }
 }
 
+/* EXPERIMENT: a received byte if there is one, else -1. */
+int dockchannel_uart_try_getbyte(void)
+{
+    if (!uart_base || read32(uart_base + DATA_RX_COUNT) == 0)
+        return -1;
+    return (read32(uart_base + DATA_RX8) >> 8) & 0xff;
+}
+
 void dockchannel_uart_write(const void *buf, size_t count)
 {
     const u8 *p = buf;
