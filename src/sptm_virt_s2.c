@@ -133,6 +133,11 @@ static u32 rg_events;
 /* Set while macOS sleeps in go mode: the guard records but changes nothing, so macOS programs its
  * sleep-time watchdog exactly as natively. A restart is still caught. */
 volatile bool sptm_virt_rg_passthrough;
+/* Timer-only GO: the guard stays as in a plain boot (no watchdog can reset the Mac) and becomes
+ * pass-through only from macOS arming its sleep-time watchdog to its stopping it after the
+ * wake, the window in which macOS must program the watchdogs as natively. */
+volatile bool sptm_virt_rg_go;
+u32 sptm_virt_rg_hold; /* host: withhold every wdt-node watchdog write (see the hook) */
 
 static void sptm_virt_rg_report(struct exc_info *ctx, const char *what, u64 addr, u64 val,
                                 bool park)
@@ -178,7 +183,69 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
                write ? "wr" : "rd", a - rg_xwdt, write ? " <- " : " ", write ? *val : 0, ctx->elr,
                sptm_virt_in_cl4() ? " (cL4)" : "");
     sptm_virt_s2r_note(ctx, addr, write ? *val : 0, write, width);
+    /*
+     * A sleep whose commit will be withheld never happens, so its 5 s reconfig watchdog must not
+     * run: XNU arms it before the commit, and it resets the Mac if the commit is late or while
+     * the host reads the ring. Its enable is kept as a shadow instead (XNU reads it back).
+     */
+    /*
+     * sptm_virt_rg_hold (set by the host before entry): no watchdog of the wdt node can reset the
+     * Mac at any time, a sleep included. The guest's writes to the sleep watchdog's control
+     * (reg 0 + 0x2c), the secondary watchdog (reg 2) and the node's other single registers are
+     * recorded and not performed, and the guest reads back what it wrote. The guard never
+     * becomes pass-through, so the primary watchdog's reset-enable stays stripped as in a
+     * plain boot. A wake that fails then stays dark instead of resetting.
+     */
+    if (sptm_virt_rg_hold) {
+        static u32 held[5];
+        static u32 held_set, held_logs;
+        int slot = -1;
+        sptm_virt_rg_passthrough = false;
+        if (rg_wdt && a == rg_wdt + WDT2_CTL)
+            slot = 0;
+        else if (rg_wdt2 && a == rg_wdt2)
+            slot = 1;
+        for (int i = 0; slot < 0 && i < 3; i++)
+            if (rg_extra[i] && a == rg_extra[i])
+                slot = 2 + i;
+        if (slot >= 0 && width == 2) {
+            if (write) {
+                held[slot] = *val;
+                held_set |= BIT(slot);
+                if (held_logs++ < 48)
+                    printf("SPTM-virt[rst c%d]: held back 0x%lx -> [0x%lx] (pc 0x%lx)\n",
+                           smp_id(), *val, addr, ctx->elr);
+                return true;
+            }
+            if (held_set & BIT(slot)) {
+                *val = held[slot];
+                return true;
+            }
+        }
+    }
+    static u32 wd2_held;
+    static bool wd2_holding;
+    if (width == 2 && rg_wdt && a == rg_wdt + WDT2_CTL && !sptm_virt_rg_passthrough) {
+        if (write && (*val & WDT2_CTL_EN) && sptm_virt_s2r_commit_withheld()) {
+            wd2_held = *val;
+            wd2_holding = true;
+            printf("SPTM-virt[rst c%d]: sleep watchdog enable 0x%lx held back (commit will be "
+                   "withheld)\n",
+                   smp_id(), *val);
+            return true;
+        }
+        if (write)
+            wd2_holding = false;
+        else if (wd2_holding) {
+            *val = wd2_held;
+            return true;
+        }
+    }
+    if (sptm_virt_rg_go && !sptm_virt_rg_passthrough && write && width == 2 && rg_wdt &&
+        a == rg_wdt + WDT2_CTL && (*val & WDT2_CTL_EN))
+        sptm_virt_rg_passthrough = true;
     if (sptm_virt_rg_passthrough) {
+        bool close = false;
         for (int w = 0; write && width == 2 && w < 2; w++) {
             u64 base = w ? rg_xwdt : rg_wdt;
             if (!base)
@@ -191,10 +258,14 @@ static bool sptm_virt_rg_hook(struct exc_info *ctx, u64 addr, u64 *val, bool wri
                                     *val, true);
                 return true;
             }
-            if (a == base + WDT2_CTL && !(*val & WDT2_CTL_EN))
+            if (a == base + WDT2_CTL && !(*val & WDT2_CTL_EN)) {
                 sptm_virt_s2r_wd_stopped();
+                close = sptm_virt_rg_go && w == 0;
+            }
         }
         sptm_virt_mmio_rw(addr, val, write, width);
+        if (close)
+            sptm_virt_rg_passthrough = false;
         return true;
     }
     if (!write) {
@@ -274,6 +345,7 @@ void sptm_virt_rg_stop_wd2(void)
 void sptm_virt_rg_disarm(void)
 {
     sptm_virt_rg_passthrough = false;
+    sptm_virt_rg_go = false;
     if (rg_wdt) {
         write32(rg_wdt + WDT_CTL, read32(rg_wdt + WDT_CTL) & ~WDT_CTL_RESET);
         write32(rg_wdt + WDT2_CTL, 0);

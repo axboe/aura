@@ -110,6 +110,11 @@ u32 sptm_virt_s2r_usb_retake; /* 1: re-take the link after a wake; n > 1: also d
 u32 sptm_virt_s2r_usb_delay_ms; /* delay from XNU's return to the re-take, 0 = default */
 u32 sptm_virt_s2r_cp_skip_ans;  /* T6050 COPROC: leave ANS's own pages unhooked */
 u32 sptm_virt_s2r_cp_ansx;      /* T6050 COPROC: S2R_CP_ANSX_* pages around ANS too */
+/* Timer-only sleep: further [base, size] ranges to capture, set by the host before entry. Each
+ * must be a 16 KiB aligned range the ADT gives (a reg entry or part of one); 0 size ends the
+ * list. The accesses are performed as issued and recorded, like the ADT's own trace blocks. */
+#define S2R_EXTRA_RANGES 32
+u64 sptm_virt_s2r_extra[S2R_EXTRA_RANGES][2];
 /* S2R_CP_ANSX_QUIET: XNU's NVMe registers (sart-ans reg[2]); per-I/O writes are only counted */
 static u64 s2r_nvme_quiet_page, s2r_nvme_quiet_n;
 
@@ -548,6 +553,13 @@ static void s2r_rtc_arm(void)
     return;
 fail:
     printf("SPTM-virt[s2r]: PMU RTC alarm not armed (SPMI error); no timed wake\n");
+}
+
+/* Timer-only sleep: the next commit will be withheld and aura will stop in the proxy. */
+bool sptm_virt_s2r_commit_withheld(void)
+{
+    return s2r_soc && s2r_soc->timer_only && sptm_virt_s2r_ring && s2r_armed() &&
+           (!s2r_go || (sptm_virt_s2r_go_count && s2r_wake_count >= sptm_virt_s2r_go_count));
 }
 
 /* The commit in go mode, before the S2R timer write goes through. */
@@ -1201,7 +1213,7 @@ void sptm_virt_s2r_setup(bool cdc)
     if (s2r_soc->timer_only) {
         /* No link keeping, USB, per-core or WFI rules: the timer's start is the sleep. */
         s2r_go = flags & SPTM_VIRT_S2R_GO;
-        sptm_virt_rg_passthrough = s2r_go;
+        sptm_virt_rg_go = s2r_go;
         if (s2r_go && sptm_virt_s2r_wake_s)
             s2r_rtc_setup();
         s2r_arm_at = mrs(CNTPCT_EL0) + S2R_ARM_AFTER_S * mrs(CNTFRQ_EL0);
@@ -1222,6 +1234,20 @@ void sptm_virt_s2r_setup(bool cdc)
             }
         }
         s2r_hook_range("s2r-timer", s2r_soc->stop_timer & ~0x3fffUL, 0x4000);
+        for (unsigned i = 0; i < S2R_EXTRA_RANGES && sptm_virt_s2r_extra[i][1]; i++) {
+            const struct s2r_trace_blk x = {sptm_virt_s2r_extra[i][0], sptm_virt_s2r_extra[i][1],
+                                            sptm_virt_s2r_extra[i][1], "extra"};
+            if (!x.base || (x.base & 0x3fff) || (x.size & 3) || x.size > ~0UL - x.base) {
+                printf("SPTM-virt[s2r]: extra range 0x%lx + 0x%lx refused\n", x.base, x.size);
+                continue;
+            }
+            printf("SPTM-virt[s2r]: capture extra 0x%lx + 0x%lx\n", x.base, x.size);
+            if (!s2r_hook_capture(&x)) {
+                s2r_arm_at = 0;
+                sptm_virt_flags &= ~sleep_flags;
+                return;
+            }
+        }
         if (flags & (SPTM_VIRT_S2R_COPROC | SPTM_VIRT_S2R_MEM))
             s2r_t6050_coproc(flags & SPTM_VIRT_S2R_MEM);
         s2r_marker("TIMERSLP", sptm_virt_s2r_pages + s2r_n_cp_pages);

@@ -82,6 +82,7 @@ bool sptm_virt_cl4_reflect(u64 *regs, u64 esr);
 
 /* sptm_virt_s2.c */
 extern volatile bool sptm_virt_rg_passthrough;
+extern volatile bool sptm_virt_rg_go;
 void sptm_virt_s2_setup(void);
 void sptm_virt_s2_enter_xnu(int cpu);
 void sptm_virt_ctrr_publish_rorgn(void);
@@ -107,6 +108,7 @@ void sptm_virt_s2r_xnu_entry(int cpu, u64 target);
 void sptm_virt_s2r_note(struct exc_info *ctx, u64 addr, u64 val, bool write, int width);
 void sptm_virt_s2r_dump_tail(u64 n);
 void sptm_virt_s2r_wd_stopped(void);
+bool sptm_virt_s2r_commit_withheld(void);
 bool sptm_virt_s2r_wfi(u64 *regs, u64 esr);
 
 /* sptm_virt_gpu.c */
