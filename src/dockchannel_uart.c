@@ -137,6 +137,24 @@ void dockchannel_uart_puts(const char *s)
     dockchannel_uart_putchar('\n');
 }
 
+/*
+ * EXPERIMENT. Every byte or none: waits for the FIFO as long as it takes, for the trace stream of
+ * a stopped guest (sptm_virt_s2r.c), where a dropped byte costs a frame and nothing else runs.
+ */
+void dockchannel_uart_write_wait(const void *buf, size_t count)
+{
+    const u8 *p = buf;
+
+    if (!uart_base)
+        return;
+    while (count--) {
+        while (read32(uart_base + DATA_TX_FREE) == 0)
+            ;
+        write32(uart_base + DATA_TX8, *p++);
+        TX_ACCEPTED(1);
+    }
+}
+
 void dockchannel_uart_write(const void *buf, size_t count)
 {
     const u8 *p = buf;

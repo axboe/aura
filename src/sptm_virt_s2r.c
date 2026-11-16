@@ -38,6 +38,8 @@
 #include "smp.h"
 #include "spmi.h"
 #include "sptm_virt_priv.h"
+#include "../build/build_tag.h"
+#include "s2r_stream.h"
 #include "sptm_virt_s2r_soc.h"
 #include "string.h"
 #include "types.h"
@@ -115,6 +117,19 @@ u32 sptm_virt_s2r_cp_ansx;      /* T6050 COPROC: S2R_CP_ANSX_* pages around ANS 
  * list. The accesses are performed as issued and recorded, like the ADT's own trace blocks. */
 #define S2R_EXTRA_RANGES 32
 u64 sptm_virt_s2r_extra[S2R_EXTRA_RANGES][2];
+/*
+ * EXPERIMENT. sptm_virt_s2r_stream (host, before entry; the number of record frames in a quick
+ * pass, 0 = off). For a machine whose debug link carries nothing aura prints under the guest and
+ * that reset when a withheld commit stopped in the proxy (K116s, 2026-11-12):
+ *  - while the guest runs, a heartbeat frame about once a second from the trace hook, sent only if
+ *    the DockChannel FIFO takes it whole, so the host knows before the sleep whether the link is up;
+ *  - at a withheld timer-only commit, no proxy and no text: the committing core masks its
+ *    interrupts, leaves every console but the DockChannel, and sends the ring newest first, a
+ *    quick pass (the last records) and a whole-ring pass in turn, for ever. Each byte waits for
+ *    the FIFO, so nothing is dropped and a host that attaches late still gets whole passes. A
+ *    reset some seconds after the stop still leaves the host the last records.
+ */
+u32 sptm_virt_s2r_stream;
 /* S2R_CP_ANSX_QUIET: XNU's NVMe registers (sart-ans reg[2]); per-I/O writes are only counted */
 static u64 s2r_nvme_quiet_page, s2r_nvme_quiet_n;
 
@@ -641,6 +656,81 @@ static void s2r_wakerec_fallback(void);
 static void s2r_wakerec_pump(void);
 static bool s2r_wakerec_printed;
 
+/* ---- EXPERIMENT: the ring streamed on the DockChannel (sptm_virt_s2r_stream) ------------------ */
+
+static void s2r_stream_send(u8 type, u32 a, u32 b, u32 c, const void *payload, u16 len)
+{
+    struct s2r_stream_hdr h;
+    u32 crc = s2r_stream_frame(&h, type, a, b, c, payload, len);
+
+    dockchannel_uart_write_wait(&h, sizeof(h));
+    dockchannel_uart_write_wait(payload, len);
+    dockchannel_uart_write_wait(&crc, sizeof(crc));
+}
+
+/* From the trace hook on any core: at most one a second, and only into a FIFO with room. */
+static void s2r_stream_heartbeat(void)
+{
+    static u64 next;
+    static u32 count;
+    u64 now = mrs(CNTPCT_EL0);
+
+    if (!sptm_virt_s2r_stream || now < next)
+        return;
+    next = now + mrs(CNTFRQ_EL0);
+    u64 payload[2] = {sptm_virt_s2r_head, now};
+    u8 f[sizeof(struct s2r_stream_hdr) + sizeof(payload) + sizeof(u32)];
+    struct s2r_stream_hdr h;
+    u32 crc = s2r_stream_frame(&h, S2R_FRAME_HEARTBEAT, count++, s2r_armed(), smp_id(), payload,
+                               sizeof(payload));
+    memcpy(f, &h, sizeof(h));
+    memcpy(f + sizeof(h), payload, sizeof(payload));
+    memcpy(f + sizeof(h) + sizeof(payload), &crc, sizeof(crc));
+    iodev_write_atomic(IODEV_DOCKCHANNEL_UART, f, sizeof(f));
+}
+
+static void __attribute__((noreturn)) s2r_stream_stop(struct exc_info *ctx, u64 addr, u64 val)
+{
+    msr(DAIF, 0xfUL << 6);
+    /* No text from here on, and no other device: uart0's domain may be off by now. */
+    for (iodev_id_t id = 0; id < IODEV_MAX; id++)
+        iodev_set_usage(id, iodev_get_usage(id) & ~(USAGE_CONSOLE | USAGE_UARTPROXY));
+    sptm_virt_s2r_quiet = true;
+    s2r_marker("S2RSTOP", addr);
+
+    static struct s2r_stream_info info;
+    info.head = sptm_virt_s2r_head;
+    info.nrec = sptm_virt_s2r_nrec;
+    info.cntfrq = mrs(CNTFRQ_EL0);
+    info.t_stop = mrs(CNTPCT_EL0);
+    info.stop_pa = addr;
+    info.stop_val = val;
+    info.pc = ctx->elr;
+    info.cpu = smp_id();
+    info.pages = sptm_virt_s2r_pages;
+    info.quick = sptm_virt_s2r_stream;
+    info.rec_size = sizeof(struct s2r_rec);
+    strncpy(info.build, BUILD_TAG, sizeof(info.build) - 1);
+
+    u64 oldest = info.head > info.nrec ? info.head - info.nrec : 0;
+    for (u32 pass = 0;; pass++) {
+        bool whole = pass & 1;
+        u32 frames = 0;
+        s2r_stream_send(S2R_FRAME_INFO, pass, 0, 0, &info, sizeof(info));
+        for (u64 end = info.head; end > oldest && (whole || frames < info.quick); frames++) {
+            u64 first = end - min(end - oldest, (u64)S2R_STREAM_CHUNK);
+            /* Not across the ring's wrap: the frame's records are one piece of memory. */
+            if (first / info.nrec != (end - 1) / info.nrec)
+                first = (end - 1) / info.nrec * info.nrec;
+            s2r_stream_send(S2R_FRAME_RECORDS, pass, first, first >> 32,
+                            &sptm_virt_s2r_ring[first % info.nrec],
+                            (end - first) * sizeof(struct s2r_rec));
+            end = first;
+        }
+        s2r_stream_send(S2R_FRAME_END, pass, frames, whole, NULL, 0);
+    }
+}
+
 static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
     /* Timer-only sleep: the S2R timer's start is the commit; everything else is recorded. */
@@ -649,6 +739,8 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
             sptm_virt_s2r_note(ctx, addr, *val, true, width);
             if (!s2r_go || (sptm_virt_s2r_go_count && s2r_wake_count >= sptm_virt_s2r_go_count)) {
                 sptm_virt_rg_disarm();
+                if (sptm_virt_s2r_stream)
+                    s2r_stream_stop(ctx, addr, *val);
                 s2r_stop_before_timer(ctx, addr, *val);
             }
             s2r_marker("S2RGO", addr);
@@ -665,6 +757,7 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
             write32(addr, *val);
             return true;
         }
+        s2r_stream_heartbeat();
         if (width == 4) {
             s2r_rw128(addr, val, write);
             sptm_virt_s2r_note(ctx, addr, val[0], write, 3);

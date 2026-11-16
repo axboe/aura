@@ -34,6 +34,10 @@
 #define SPTM_VIRT_ALIGN     (2UL << 20) /* an L2 block */
 
 volatile bool sptm_virt_guest_live;
+/* EXPERIMENT (host, before entry): leave aura's USB gadgets as they are at the guest's entry. On
+ * the K116s nothing aura prints reaches the host over the debug link from the entry on; the
+ * gadgets' shutdown there is one candidate for what cuts it. */
+u32 sptm_virt_keep_usb;
 volatile bool sptm_virt_xnu_live;
 volatile u64 sptm_virt_bss_canary;
 u64 sptm_virt_flags;
@@ -526,7 +530,7 @@ __attribute__((used, retain)) void sptm_virt_enter(void)
      * DockChannel nothing uses them, and the guest, which has their nodes hidden, does not know
      * them: shut them down.
      */
-    if (uartproxy_iodev == IODEV_DOCKCHANNEL_UART)
+    if (uartproxy_iodev == IODEV_DOCKCHANNEL_UART && !sptm_virt_keep_usb)
         usb_iodev_shutdown();
 
     /* The proxy flow never passes through kboot's nv2_prepare. */

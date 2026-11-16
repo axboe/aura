@@ -10,6 +10,7 @@ int dockchannel_uart_init(void);
 /* Free bytes in the TX FIFO, 0 without a DockChannel. */
 u32 dockchannel_uart_tx_free(void);
 void dockchannel_uart_set_tx_timeout(u32 ms);
+void dockchannel_uart_write_wait(const void *buf, size_t count);
 void dockchannel_uart_putbyte(u8 c);
 u8 dockchannel_uart_getbyte(void);
 
